@@ -99,6 +99,46 @@ Example output:
 
 ---
 
+## 🎬 Visual Experience
+
+When you run `nixdr`, you get live feedback:
+
+### Success — No errors detected
+
+During the Nix command, a Catppuccin-themed spinner runs:
+
+```
+❄️  Running nix flake check...
+```
+
+On success, a green bordered banner appears:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅   No errors detected!   nix flake check
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### Error detected — Analysis in progress
+
+If an error occurs, the spinner changes:
+
+```
+🔍  Analyzing error trace...
+```
+
+Then the structured diagnosis is printed with the full error class, location, trace, and actionable suggestions.
+
+### Pipe mode — Retroactive analysis
+
+```bash
+nix build . --show-trace 2>&1 | nixdr --stdin
+```
+
+The analysis spinner appears briefly, then the full diagnosis is printed.
+
+---
+
 ## 🎨 Before & After
 
 ### ❌ Raw Nix Output
