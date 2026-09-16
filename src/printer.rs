@@ -167,7 +167,7 @@ impl Printer {
         }
     }
 
-    fn dim(&self, text: &str) -> String {
+    pub fn dim(&self, text: &str) -> String {
         if self.use_color {
             text.bright_black().to_string()
         } else {

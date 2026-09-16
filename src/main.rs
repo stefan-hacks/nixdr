@@ -3,26 +3,25 @@
 //! Reads Nix stderr, parses error messages, classifies them into known
 //! patterns, and prints colorized, actionable diagnostics.
 //!
-//! Usage:
-//!   nixdr build .#myPackage          # wraps `nix build`, intercepts stderr
-//!   nixdr eval --expr '...'           # wraps `nix eval`, intercepts stderr
-//!   nixdr check                       # wraps `nix flake check`
-//!   nixdr --stdin                     # reads nix stderr from stdin
-//!   nixdr --json                      # output JSON instead of pretty-print
+//! Golden rule for reading Nix traces: they are printed bottom-up.
+//! Your code is at the BOTTOM of the trace; the crash is at the TOP.
 //!
-//! Design:
-//! - Spinner: Catppuccin-themed progress during Nix execution
-//! - Parser: tokenises Nix stderr into structured ErrorReport
-//! - Classifier: maps to one of 5 error classes
-//! - Suggester: attaches actionable fixes
-//! - Printer: bordered panel output with Catppuccin Mocha colors
+//! Usage:
+//!   nixdr build .                     # wrapper: run nix build with diagnosis
+//!   nixdr eval --expr '...'           # wrapper: run nix eval with diagnosis
+//!   nix build 2>&1 | nixdr --stdin    # pipe: diagnose after the fact
+//!   nix build 2>&1 | nixdr --stdin --json   # JSON output for CI
 
-use clap::{Parser, Subcommand};
-use indicatif::{ProgressBar, ProgressStyle};
-use owo_colors::OwoColorize;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+use clap::{ColorChoice, Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
+use owo_colors::OwoColorize;
+
+use parser::NixErrorParser;
+use printer::{ColorMode, Printer};
 
 mod diagnosis;
 mod parser;
@@ -30,238 +29,366 @@ mod printer;
 mod suggest;
 mod trace;
 
-use parser::NixErrorParser;
-use printer::{ColorMode, Printer};
+// ═══════════════════════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════════════════════
 
-/// Nix error diagnosis and human-readable reporting tool.
 #[derive(Parser)]
-#[command(name = "nixdr")]
-#[command(about = "Nix error diagnosis and human-readable reporting tool")]
-#[command(version)]
+#[command(
+    name = "nixdr",
+    about = "Nix Error Doctor — human-readable, colorized diagnostics",
+    version,
+    color = ColorChoice::Auto
+)]
 struct Cli {
-    /// Enable JSON output instead of pretty-printed diagnostics.
-    #[arg(long, global = true)]
-    json: bool,
+    #[command(subcommand)]
+    command: Option<Commands>,
 
-    /// Color output mode.
-    #[arg(long, global = true, value_enum, default_value = "auto")]
-    color: ColorModeArg,
-
-    /// Disable suggestions (print error summary only).
-    #[arg(long, global = true)]
-    no_suggest: bool,
-
-    /// Show full trace (equivalent to --show-trace).
-    #[arg(long, global = true)]
-    trace: bool,
-
-    /// Read Nix stderr from stdin instead of running a command.
+    /// Read error from stdin instead of running a command
     #[arg(long, global = true)]
     stdin: bool,
 
-    /// Subcommand to run (wrapping the corresponding `nix` command).
-    #[command(subcommand)]
-    command: Option<NixCommand>,
-}
+    /// JSON output (machine-readable)
+    #[arg(long, global = true)]
+    json: bool,
 
-#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
-enum ColorModeArg {
-    Auto,
-    Always,
-    Never,
+    /// Color mode: auto | always | never
+    #[arg(long, global = true, value_name = "MODE", default_value = "auto")]
+    color: String,
+
+    /// Show full trace including nixpkgs internals
+    #[arg(long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
-enum NixCommand {
-    /// Build a derivation (wraps `nix build`).
-    Build {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Evaluate a Nix expression (wraps `nix eval`).
-    Eval {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Run flake checks (wraps `nix flake check`).
-    Check {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Rebuild NixOS config (wraps `nixos-rebuild`).
-    Rebuild {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Develop in a Nix shell (wraps `nix develop`).
-    Develop {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Run a derivation (wraps `nix run`).
-    Run {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
+enum Commands {
+    /// `nix build` with error diagnosis
+    Build { args: Vec<String> },
+    /// `nix eval` with error diagnosis
+    Eval { args: Vec<String> },
+    /// `nix flake check` with error diagnosis
+    Check { args: Vec<String> },
+    /// `nixos-rebuild` with error diagnosis
+    Rebuild { args: Vec<String> },
+    /// `nix develop` with error diagnosis
+    Develop { args: Vec<String> },
+    /// `nix run` with error diagnosis
+    Run { args: Vec<String> },
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    let color_mode = match cli.color {
-        ColorModeArg::Auto => ColorMode::Auto,
-        ColorModeArg::Always => ColorMode::Always,
-        ColorModeArg::Never => ColorMode::Never,
-    };
-
+    let color_mode = parse_color_mode(&cli.color);
     let printer = Printer::new(color_mode);
-    let use_color = printer.use_color;
 
-    // Read Nix stderr
-    let stderr_text = if cli.stdin {
-        read_stdin()
-    } else if let Some(cmd) = cli.command {
-        let nix_cmd_info = describe_nix_command(&cmd);
-        let spinner = start_spinner(&nix_cmd_info, use_color);
-        
-        let result = run_nix_command(cmd, cli.trace);
-        spinner.finish_and_clear();
-        
-        match result {
-            Ok((stdout, stderr, code)) => {
-                // Pass through stdout
-                if let Some(ref s) = stdout {
-                    let _ = io::stdout().write_all(s.as_bytes());
-                }
-                // If exit code is 0, nix succeeded.
-                if code == 0 {
-                    print_success_banner(&nix_cmd_info, use_color);
-                    std::process::exit(0);
-                }
-                stderr.unwrap_or_default()
-            }
-            Err(e) => {
-                eprintln!("{} {}", "❌".to_string(), e.bright_red());
-                std::process::exit(1);
-            }
-        }
-    } else {
-        eprintln!("nixdr: expected --stdin or a subcommand (build, eval, check, rebuild, develop, run)");
-        std::process::exit(1);
-    };
-
-    if stderr_text.trim().is_empty() {
-        print_no_errors(use_color);
-        std::process::exit(0);
+    if cli.stdin {
+        let mut buf = String::new();
+        io::stdin()
+            .read_to_string(&mut buf)
+            .expect("Failed to read stdin");
+        process_stdin(&buf, &cli, &printer);
+        return;
     }
 
-    // Show analysis spinner
-    let analysis_spinner = start_analysis_spinner(use_color);
-    
-    // Parse
-    let mut parser = NixErrorParser::new(&stderr_text);
-    let report = parser.parse();
-    
-    // Suggest fixes if enabled
-    let report = if cli.no_suggest {
-        report
-    } else {
-        suggest::enrich(report)
+    let exit_code = match cli.command {
+        Some(Commands::Build { ref args }) => {
+            execute_with_spinner(("nix", vec!["build"], args.clone()), &printer)
+        }
+        Some(Commands::Eval { ref args }) => {
+            execute_with_spinner(("nix", vec!["eval"], args.clone()), &printer)
+        }
+        Some(Commands::Check { ref args }) => execute_with_spinner(
+            ("nix", vec!["flake", "check"], args.clone()),
+            &printer,
+        ),
+        Some(Commands::Rebuild { ref args }) => {
+            execute_with_spinner(("nixos-rebuild", vec![], args.clone()), &printer)
+        }
+        Some(Commands::Develop { ref args }) => {
+            execute_with_spinner(("nix", vec!["develop"], args.clone()), &printer)
+        }
+        Some(Commands::Run { ref args }) => {
+            execute_with_spinner(("nix", vec!["run"], args.clone()), &printer)
+        }
+        None => {
+            eprintln!("Usage: nixdr <command> [args...]");
+            eprintln!("       nixdr --stdin < raw_nix_stderr");
+            std::process::exit(1);
+        }
     };
-    
-    analysis_spinner.finish_and_clear();
 
-    // Print
+    std::process::exit(exit_code);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Color mode parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn parse_color_mode(s: &str) -> ColorMode {
+    match s.to_lowercase().as_str() {
+        "always" => ColorMode::Always,
+        "never" => ColorMode::Never,
+        _ => ColorMode::Auto,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Execute wrapper command with live spinner
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn execute_with_spinner(
+    (bin, fixed_args, user_args): (&str,
+    Vec<&str>,
+    Vec<String>),
+    printer: &Printer,
+) -> i32 {
+    let desc = format!("{} {}", bin, fixed_args.join(" "));
+    let pb = start_spinner(&desc, printer.use_color);
+
+    let mut cmd = Command::new(bin);
+    for a in &fixed_args {
+        cmd.arg(a);
+    }
+    for a in &user_args {
+        cmd.arg(a);
+    }
+
+    let output = cmd
+        .stderr(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .output()
+        .expect("Failed to spawn nix command");
+
+    let code = output.status.code().unwrap_or(1);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    pb.finish_and_clear();
+
+    // If exit code is 0, nix succeeded. Print any stderr raw (warnings/notices).
+    if code == 0 {
+        let (notices, _) = separate_notices(&stderr);
+        if !notices.is_empty() {
+            print_notices(&notices, printer);
+        }
+        print_success_banner(&desc, printer.use_color);
+        return 0;
+    }
+
+    // Error detected — analyze
+    let analysis_pb = start_analysis_spinner(printer.use_color);
+    let (notices, error_text) = separate_notices(&stderr);
+    let text_to_parse = if error_text.is_empty() {
+        &stderr
+    } else {
+        &error_text
+    };
+
+    let mut report = NixErrorParser::new(text_to_parse).parse();
+    report = suggest::enrich(report);
+    analysis_pb.finish_and_clear();
+
+    // Print notices first (if any)
+    if !notices.is_empty() {
+        print_notices(&notices, printer);
+    }
+
+    printer.print(&report);
+
+    code
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pipe mode (stdin)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn process_stdin(stderr: &str, cli: &Cli, printer: &Printer) {
+    let (notices, error_text) = separate_notices(stderr);
+    let text_to_parse = if error_text.is_empty() {
+        stderr
+    } else {
+        &error_text
+    };
+
+    if text_to_parse.trim().is_empty() {
+        if !notices.is_empty() {
+            print_notices(&notices, printer);
+        }
+        print_no_errors(printer.use_color);
+        return;
+    }
+
+    let analysis_pb = start_analysis_spinner(printer.use_color);
+    let mut report = NixErrorParser::new(text_to_parse).parse();
+    report = suggest::enrich(report);
+    analysis_pb.finish_and_clear();
+
+    if !notices.is_empty() {
+        print_notices(&notices, printer);
+    }
+
     if cli.json {
         match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{}", json),
-            Err(e) => {
-                eprintln!("nixdr: JSON serialization failed: {}", e);
-                std::process::exit(1);
-            }
+            Ok(j) => println!("{}", j),
+            Err(e) => eprintln!("JSON serialization failed: {}", e),
         }
     } else {
         printer.print(&report);
     }
-
-    // Exit with error since there was stderr content
-    std::process::exit(1);
 }
 
-fn describe_nix_command(cmd: &NixCommand) -> String {
-    match cmd {
-        NixCommand::Build { .. } => "nix build".to_string(),
-        NixCommand::Eval { .. } => "nix eval".to_string(),
-        NixCommand::Check { .. } => "nix flake check".to_string(),
-        NixCommand::Rebuild { .. } => "nixos-rebuild".to_string(),
-        NixCommand::Develop { .. } => "nix develop".to_string(),
-        NixCommand::Run { .. } => "nix run".to_string(),
+// ═══════════════════════════════════════════════════════════════════════════
+// Separate Nix notices/warnings from actual errors
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Nix prints warnings and notices to stderr even on success.
+/// These lines start with "warning:" or are known notice patterns.
+/// Returns (notices, error_text) where error_text contains the actual error.
+fn separate_notices(stderr: &str) -> (Vec<String>, String) {
+    let known_notice_patterns = [
+        "warning:",
+        "Using saved setting for",
+        "ignoring untrusted",
+        "Pass '--accept-flake-config'",
+        "you are not a trusted user",
+        "Run `man nix.conf`",
+    ];
+
+    let mut notices = Vec::new();
+    let mut error_lines = Vec::new();
+    let mut in_error_block = false;
+
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("error:") || trimmed.starts_with("error ") {
+            in_error_block = true;
+        }
+
+        let is_notice = known_notice_patterns
+            .iter()
+            .any(|pat| trimmed.contains(pat));
+        if is_notice && !in_error_block {
+            notices.push(line.to_string());
+        } else {
+            error_lines.push(line.to_string());
+        }
     }
+
+    // If we found no error block, everything goes to error_text
+    let error_text = if error_lines.is_empty() {
+        stderr.to_string()
+    } else {
+        error_lines.join("\n")
+    };
+
+    (notices, error_text)
 }
+
+fn print_notices(notices: &[String], printer: &Printer) {
+    let mut stdout = io::stdout();
+    let _ = writeln!(&mut stdout);
+    let _ = writeln!(&mut stdout, "{}", printer.dim("Notices:"));
+    for notice in notices {
+        let _ = writeln!(&mut stdout, "  {}", printer.dim(notice));
+    }
+    let _ = writeln!(&mut stdout);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Spinner helpers
+// ═══════════════════════════════════════════════════════════════════════════
 
 fn start_spinner(desc: &str, use_color: bool) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
-    pb.enable_steady_tick(Duration::from_millis(100));
-    
+    let tick_strings: Vec<String> = if use_color {
+        vec![
+            "❄️ ".to_string(),
+            "🌨️ ".to_string(),
+            "⛄ ".to_string(),
+            "🌨️ ".to_string(),
+            "❄️ ".to_string(),
+        ]
+    } else {
+        vec![
+            "⠋".to_string(),
+            "⠙".to_string(),
+            "⠹".to_string(),
+            "⠸".to_string(),
+            "⠼".to_string(),
+            "⠴".to_string(),
+            "⠦".to_string(),
+            "⠧".to_string(),
+            "⠇".to_string(),
+            "⠏".to_string(),
+        ]
+    };
+    let tick_refs: Vec<&str> = tick_strings.iter().map(|s| s.as_str()).collect();
+    let style = ProgressStyle::default_spinner()
+        .tick_strings(&tick_refs)
+        .template("{spinner} {msg}")
+        .unwrap();
+    pb.set_style(style);
+    pb.enable_steady_tick(Duration::from_millis(120));
+
     if use_color {
-        let style = ProgressStyle::default_spinner()
-            .tick_strings(&[
-                "❄️  ",
-                "❄️  ",
-                "🌨️  ",
-                "❄️  ",
-                "🌨️  ",
-                "❄️  ",
-                "🌨️  ",
-                "✅  ",
-            ])
-            .template("{spinner} {msg}")
-            .unwrap();
-        pb.set_style(style);
         let running = "Running".truecolor(137, 220, 235).to_string();
         let cmd_colored = desc.truecolor(203, 166, 247).to_string();
         pb.set_message(format!("{} {}", running, cmd_colored));
     } else {
-        let style = ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap();
-        pb.set_style(style);
         pb.set_message(format!("Running {}", desc));
     }
-    
+
     pb
 }
 
 fn start_analysis_spinner(use_color: bool) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
-    pb.enable_steady_tick(Duration::from_millis(80));
-    
+    let tick_strings: Vec<String> = if use_color {
+        vec![
+            "🔍 ".to_string(),
+            "✨ ".to_string(),
+            "🔍 ".to_string(),
+            "✨ ".to_string(),
+            "🔍 ".to_string(),
+            "✨ ".to_string(),
+        ]
+    } else {
+        vec![
+            "⠋".to_string(),
+            "⠙".to_string(),
+            "⠹".to_string(),
+            "⠸".to_string(),
+            "⠼".to_string(),
+            "⠴".to_string(),
+            "⠦".to_string(),
+            "⠧".to_string(),
+            "⠇".to_string(),
+            "⠏".to_string(),
+        ]
+    };
+    let tick_refs: Vec<&str> = tick_strings.iter().map(|s| s.as_str()).collect();
+    let style = ProgressStyle::default_spinner()
+        .tick_strings(&tick_refs)
+        .template("{spinner} {msg}")
+        .unwrap();
+    pb.set_style(style);
+    pb.enable_steady_tick(Duration::from_millis(120));
+
     if use_color {
-        let style = ProgressStyle::default_spinner()
-            .tick_strings(&[
-                "❄️  ",
-                "🔍  ",
-                "❄️  ",
-                "🔍  ",
-                "❄️  ",
-                "✅  ",
-            ])
-            .template("{spinner} {msg}")
-            .unwrap();
-        pb.set_style(style);
         let msg = "Analyzing error trace...".to_string();
         let colored = msg.truecolor(250, 179, 135).to_string();
         pb.set_message(colored);
     } else {
-        let style = ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap();
-        pb.set_style(style);
-        pb.set_message("Analyzing error trace...");
+        pb.set_message("Analyzing error trace...".to_string());
     }
-    
+
     pb
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Success / no-error banners
+// ═══════════════════════════════════════════════════════════════════════════
 
 fn print_success_banner(cmd: &str, use_color: bool) {
     let width = terminal_size::terminal_size()
@@ -270,125 +397,33 @@ fn print_success_banner(cmd: &str, use_color: bool) {
         .min(80);
 
     if use_color {
-        let border_raw = "━".repeat(width);
-        let border = border_raw.bright_green();
-        let inner_raw = format!("  {}  ", cmd);
-        let inner = inner_raw.bright_green();
-        let check_raw = "✅".to_string();
-        let check = check_raw.bright_green();
-        println!("\n{}", border);
-        println!("{}   No errors detected!   {}", check, inner);
-        println!("{}", border);
-        println!();
+        let line = "━".repeat(width).truecolor(166, 227, 161).to_string();
+        let ok = "✅".to_string();
+        let label = format!("{}   No errors detected!   {}", ok, cmd)
+            .truecolor(166, 227, 161)
+            .bold()
+            .to_string();
+        println!("\n{}", line);
+        println!("{}", label);
+        println!("{}\n", line);
     } else {
-        let border = "=".repeat(width);
-        println!("\n{}", border);
-        println!("[OK] {} — No errors detected!", cmd);
-        println!("{}", border);
-        println!();
+        let line = "=".repeat(width);
+        println!("\n{}", line);
+        println!("[OK]   No errors detected!   {}", cmd);
+        println!("{}\n", line);
     }
 }
 
 fn print_no_errors(use_color: bool) {
     if use_color {
         println!(
-            "\n{} {}\n",
-            "✅".to_string().bright_green(),
-            "No Nix errors detected in provided stderr.".bright_green()
+            "\n{}  {}",
+            "✅".to_string(),
+            "No errors found in provided stderr."
+                .truecolor(166, 227, 161)
+                .to_string()
         );
     } else {
-        println!("\n[OK] No Nix errors detected in provided stderr.\n");
+        println!("\n[OK] No errors found in provided stderr.");
     }
-}
-
-fn read_stdin() -> String {
-    let stdin = io::stdin();
-    let mut buf = String::new();
-    for line in stdin.lock().lines() {
-        if let Ok(l) = line {
-            buf.push_str(&l);
-            buf.push('\n');
-        }
-    }
-    buf
-}
-
-fn run_nix_command(cmd: NixCommand, show_trace: bool) -> Result<(Option<String>, Option<String>, i32), String> {
-    let (nix_cmd, args): (&str, Vec<String>) = match cmd {
-        NixCommand::Build { args } => ("nix", {
-            let mut v = vec!["build".to_string()];
-            if show_trace { v.push("--show-trace".to_string()); }
-            v.extend(args);
-            v
-        }),
-        NixCommand::Eval { args } => ("nix", {
-            let mut v = vec!["eval".to_string()];
-            if show_trace { v.push("--show-trace".to_string()); }
-            v.extend(args);
-            v
-        }),
-        NixCommand::Check { args } => ("nix", {
-            let mut v = vec!["flake".to_string(), "check".to_string()];
-            if show_trace { v.push("--show-trace".to_string()); }
-            v.extend(args);
-            v
-        }),
-        NixCommand::Rebuild { args } => ("nixos-rebuild", {
-            let mut v = vec![];
-            v.extend(args);
-            if show_trace && !v.iter().any(|a| a == "--show-trace") {
-                v.push("--show-trace".to_string());
-            }
-            v
-        }),
-        NixCommand::Develop { args } => ("nix", {
-            let mut v = vec!["develop".to_string()];
-            if show_trace { v.push("--show-trace".to_string()); }
-            v.extend(args);
-            v
-        }),
-        NixCommand::Run { args } => ("nix", {
-            let mut v = vec!["run".to_string()];
-            if show_trace { v.push("--show-trace".to_string()); }
-            v.extend(args);
-            v
-        }),
-    };
-
-    let mut command = Command::new(nix_cmd);
-    command.args(&args);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("failed to spawn {}: {}", nix_cmd, e))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .map(|mut r| {
-            let mut s = String::new();
-            let _ = std::io::Read::read_to_string(&mut r, &mut s);
-            s
-        })
-        .filter(|s| !s.is_empty());
-
-    let stderr = child
-        .stderr
-        .take()
-        .map(|mut r| {
-            let mut s = String::new();
-            let _ = std::io::Read::read_to_string(&mut r, &mut s);
-            s
-        })
-        .filter(|s| !s.is_empty());
-
-    let status = child
-        .wait()
-        .map_err(|e| format!("failed to wait for {}: {}", nix_cmd, e))?;
-
-    let code = status.code().unwrap_or(1);
-
-    Ok((stdout, stderr, code))
 }
