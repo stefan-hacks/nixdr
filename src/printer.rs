@@ -169,10 +169,15 @@ impl Printer {
 
     pub fn dim(&self, text: &str) -> String {
         if self.use_color {
-            text.bright_black().to_string()
+            text.truecolor(108, 112, 134).to_string()
         } else {
             text.to_string()
         }
+    }
+
+    /// Print raw text with no processing.
+    pub fn print_raw(&self, text: &str) {
+        println!("{}", text);
     }
 
     fn indent(&self, text: &str, spaces: usize) -> String {

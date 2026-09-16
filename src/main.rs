@@ -88,8 +88,8 @@ fn main() {
         io::stdin()
             .read_to_string(&mut buf)
             .expect("Failed to read stdin");
-        process_stdin(&buf, &cli, &printer);
-        return;
+        let has_error = process_stdin(&buf, &cli, &printer);
+        std::process::exit(if has_error { 1 } else { 0 });
     }
 
     let exit_code = match cli.command {
@@ -179,17 +179,21 @@ fn execute_with_spinner(
     // Error detected — analyze
     let analysis_pb = start_analysis_spinner(printer.use_color);
     let (notices, error_text) = separate_notices(&stderr);
-    let text_to_parse = if error_text.is_empty() {
-        &stderr
-    } else {
-        &error_text
-    };
-
-    let mut report = NixErrorParser::new(text_to_parse).parse();
-    report = suggest::enrich(report);
     analysis_pb.finish_and_clear();
 
-    // Print notices first (if any)
+    // If the only stderr content was notices (no actual error block), print them
+    if error_text.trim().is_empty() {
+        if !notices.is_empty() {
+            print_notices(&notices, printer);
+        }
+        // Nix exited non-zero but only printed warnings. Show raw stderr.
+        printer.print_raw(&stderr);
+        return code;
+    }
+
+    let mut report = NixErrorParser::new(&error_text).parse();
+    report = suggest::enrich(report);
+
     if !notices.is_empty() {
         print_notices(&notices, printer);
     }
@@ -203,9 +207,13 @@ fn execute_with_spinner(
 // Pipe mode (stdin)
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn process_stdin(stderr: &str, cli: &Cli, printer: &Printer) {
+fn process_stdin(stderr: &str, cli: &Cli, printer: &Printer) -> bool {
     let (notices, error_text) = separate_notices(stderr);
-    let text_to_parse = if error_text.is_empty() {
+
+    // If we found no error block AND there were notices, there is no real error
+    let text_to_parse = if error_text.is_empty() && !notices.is_empty() {
+        ""
+    } else if error_text.is_empty() {
         stderr
     } else {
         &error_text
@@ -216,7 +224,7 @@ fn process_stdin(stderr: &str, cli: &Cli, printer: &Printer) {
             print_notices(&notices, printer);
         }
         print_no_errors(printer.use_color);
-        return;
+        return false;
     }
 
     let analysis_pb = start_analysis_spinner(printer.use_color);
@@ -236,6 +244,8 @@ fn process_stdin(stderr: &str, cli: &Cli, printer: &Printer) {
     } else {
         printer.print(&report);
     }
+
+    true
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -275,8 +285,10 @@ fn separate_notices(stderr: &str) -> (Vec<String>, String) {
         }
     }
 
-    // If we found no error block, everything goes to error_text
-    let error_text = if error_lines.is_empty() {
+    // If we found no error block AND only notices exist, there is no real error
+    let error_text = if error_lines.is_empty() && !notices.is_empty() {
+        String::new()
+    } else if error_lines.is_empty() {
         stderr.to_string()
     } else {
         error_lines.join("\n")
