@@ -3,56 +3,71 @@
 A blazingly fast Rust tool that reads Nix error messages and produces
 human-readable, colorized, actionable diagnostics.
 
-## Why nixdr?
+**No installation required** — run directly with `nix run`.
 
-Nix error traces are printed **bottom-up**: the first frame is deep inside
-nixpkgs; the last frame is your code. `nixdr` restructures them into a
-natural top-down flow, classifies the error into one of five known patterns,
-and attaches context-aware fix suggestions.
+## Quick Start (No Install)
 
-## Installation
-
-### Via Nix flake
+Replace any `nix` command with `nix run`:
 
 ```bash
+# Instead of: nix build . --show-trace
 nix run github:stefan-hacks/nixdr -- build .
+
+# Instead of: nix eval --expr '...' --show-trace
+nix run github:stefan-hacks/nixdr -- eval --expr 'let x = x; in x'
+
+# Instead of: nix flake check --show-trace
+nix run github:stefan-hacks/nixdr -- check
+
+# Instead of: nixos-rebuild switch --flake .#
+nix run github:stefan-hacks/nixdr -- rebuild switch --flake .#
+
+# nix develop / nix run work too
+nix run github:stefan-hacks/nixdr -- develop .
+nix run github:stefan-hacks/nixdr -- run nixpkgs#hello
 ```
 
-### From source
+`nixdr` intercepts stderr from the wrapped command, parses any Nix error,
+classifies it, and prints a beautiful diagnostic. If the build succeeds,
+you see normal output — `nixdr` is silent on success.
+
+### Pipe mode (if you can't replace the command)
 
 ```bash
-git clone https://github.com/stefan-hacks/nixdr.git
-cd nixdr
-cargo build --release
-sudo cp target/release/nixdr /usr/local/bin/
-```
-
-## Usage
-
-### Wrapper mode (recommended)
-
-Replace `nix` commands with `nixdr` equivalents — it runs the underlying
-`nix` command, captures stderr, and pretty-prints any errors:
-
-```bash
-nixdr build .                    # nix build with error diagnosis
-nixdr eval --expr '...'          # nix eval with error diagnosis
-nixdr check                      # nix flake check with error diagnosis
-nixdr rebuild switch --flake .#  # nixos-rebuild with error diagnosis
-nixdr develop .                  # nix develop with error diagnosis
-nixdr run nixpkgs#hello          # nix run with error diagnosis
-```
-
-### Pipe mode
-
-```bash
-nix build . --show-trace 2>&1 | nixdr --stdin
+nix build . --show-trace 2>&1 | nix run github:stefan-hacks/nixdr -- --stdin
 ```
 
 ### JSON output (for CI / editors)
 
 ```bash
-nix build . --show-trace 2>&1 | nixdr --stdin --json
+nix build . --show-trace 2>&1 | nix run github:stefan-hacks/nixdr -- --stdin --json
+```
+
+## Why nixdr?
+
+Nix error traces are printed **bottom-up**: the first frame is deep inside
+nixpkgs; the last frame is your code. `nixdr` restructures them into a
+natural top-down flow, classifies the error into one of five known patterns,
+and attaches context-aware fix suggestions with code snippets.
+
+**Before:**
+```
+error: infinite recursion encountered
+       at /nix/store/...-nixpkgs/lib/modules.nix:...
+       ... 30 more frames ...
+       at /home/you/flake.nix:42:5
+```
+
+**After (nixdr):**
+```
+[INFINITE RECURSION] Infinite recursion: an attribute depends on itself
+  at «string»:1:9
+
+Suggestions:
+  1. Add a default value or guard
+     An attribute depends on itself. Break the cycle with `lib.mkDefault`.
+     Change to:
+       myOption = lib.mkDefault "defaultValue";
 ```
 
 ## Error Classes
@@ -76,21 +91,32 @@ nix build . --show-trace 2>&1 | nixdr --stdin --json
 
 Disable with `--color=never` or `NO_COLOR=1`.
 
-## NixOS / Home Manager Integration
+## Installing (Optional)
 
-Add to your `home.packages` or `environment.systemPackages`:
+If you want `nixdr` in your PATH permanently:
+
+### Via Nix flake (declarative)
+
+Add the input to your flake and include the package:
 
 ```nix
-nixdr.packages.${pkgs.system}.default
+{
+  inputs.nixdr.url = "github:stefan-hacks/nixdr";
+
+  # In your NixOS or Home Manager config:
+  environment.systemPackages = [
+    inputs.nixdr.packages.${pkgs.system}.default
+  ];
+}
 ```
 
-Or use the flake output directly in a shell:
+### From source
 
-```nix
-{ inputs, pkgs, ... }:
-{
-  home.packages = [ inputs.nixdr.packages.${pkgs.system}.default ];
-}
+```bash
+git clone https://github.com/stefan-hacks/nixdr.git
+cd nixdr
+cargo build --release
+# Binary at target/release/nixdr
 ```
 
 ## Contributing
