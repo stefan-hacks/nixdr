@@ -9,17 +9,20 @@
 //!   nixdr check                       # wraps `nix flake check`
 //!   nixdr --stdin                     # reads nix stderr from stdin
 //!   nixdr --json                      # output JSON instead of pretty-print
-//!   nixdr --theme mocha               # Catppuccin Mocha color scheme
 //!
 //! Design:
+//! - Spinner: Catppuccin-themed progress during Nix execution
 //! - Parser: tokenises Nix stderr into structured ErrorReport
 //! - Classifier: maps to one of 5 error classes
 //! - Suggester: attaches actionable fixes
-//! - Printer: Catppuccin Mocha colorized output (or JSON)
+//! - Printer: bordered panel output with Catppuccin Mocha colors
 
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
+use owo_colors::OwoColorize;
 use std::io::{self, BufRead, Write};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 mod diagnosis;
 mod parser;
@@ -112,26 +115,33 @@ fn main() {
     };
 
     let printer = Printer::new(color_mode);
+    let use_color = printer.use_color;
 
     // Read Nix stderr
     let stderr_text = if cli.stdin {
         read_stdin()
     } else if let Some(cmd) = cli.command {
-        match run_nix_command(cmd, cli.trace) {
+        let nix_cmd_info = describe_nix_command(&cmd);
+        let spinner = start_spinner(&nix_cmd_info, use_color);
+        
+        let result = run_nix_command(cmd, cli.trace);
+        spinner.finish_and_clear();
+        
+        match result {
             Ok((stdout, stderr, code)) => {
                 // Pass through stdout
                 if let Some(ref s) = stdout {
                     let _ = io::stdout().write_all(s.as_bytes());
                 }
-                // If exit code is 0, nix succeeded. Ignore any stderr
-                // (Nix prints warnings/notices to stderr even on success).
+                // If exit code is 0, nix succeeded.
                 if code == 0 {
+                    print_success_banner(&nix_cmd_info, use_color);
                     std::process::exit(0);
                 }
                 stderr.unwrap_or_default()
             }
             Err(e) => {
-                eprintln!("nixdr: failed to run nix command: {}", e);
+                eprintln!("{} {}", "❌".to_string(), e.bright_red());
                 std::process::exit(1);
             }
         }
@@ -141,20 +151,25 @@ fn main() {
     };
 
     if stderr_text.trim().is_empty() {
-        eprintln!("nixdr: no stderr to diagnose");
+        print_no_errors(use_color);
         std::process::exit(0);
     }
 
+    // Show analysis spinner
+    let analysis_spinner = start_analysis_spinner(use_color);
+    
     // Parse
     let mut parser = NixErrorParser::new(&stderr_text);
     let report = parser.parse();
-
+    
     // Suggest fixes if enabled
     let report = if cli.no_suggest {
         report
     } else {
         suggest::enrich(report)
     };
+    
+    analysis_spinner.finish_and_clear();
 
     // Print
     if cli.json {
@@ -169,8 +184,121 @@ fn main() {
         printer.print(&report);
     }
 
-    // Exit with the same exit code as the wrapped command
+    // Exit with error since there was stderr content
     std::process::exit(1);
+}
+
+fn describe_nix_command(cmd: &NixCommand) -> String {
+    match cmd {
+        NixCommand::Build { .. } => "nix build".to_string(),
+        NixCommand::Eval { .. } => "nix eval".to_string(),
+        NixCommand::Check { .. } => "nix flake check".to_string(),
+        NixCommand::Rebuild { .. } => "nixos-rebuild".to_string(),
+        NixCommand::Develop { .. } => "nix develop".to_string(),
+        NixCommand::Run { .. } => "nix run".to_string(),
+    }
+}
+
+fn start_spinner(desc: &str, use_color: bool) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(100));
+    
+    if use_color {
+        let style = ProgressStyle::default_spinner()
+            .tick_strings(&[
+                "❄️  ",
+                "❄️  ",
+                "🌨️  ",
+                "❄️  ",
+                "🌨️  ",
+                "❄️  ",
+                "🌨️  ",
+                "✅  ",
+            ])
+            .template("{spinner} {msg}")
+            .unwrap();
+        pb.set_style(style);
+        let running = "Running".truecolor(137, 220, 235).to_string();
+        let cmd_colored = desc.truecolor(203, 166, 247).to_string();
+        pb.set_message(format!("{} {}", running, cmd_colored));
+    } else {
+        let style = ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap();
+        pb.set_style(style);
+        pb.set_message(format!("Running {}", desc));
+    }
+    
+    pb
+}
+
+fn start_analysis_spinner(use_color: bool) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(80));
+    
+    if use_color {
+        let style = ProgressStyle::default_spinner()
+            .tick_strings(&[
+                "❄️  ",
+                "🔍  ",
+                "❄️  ",
+                "🔍  ",
+                "❄️  ",
+                "✅  ",
+            ])
+            .template("{spinner} {msg}")
+            .unwrap();
+        pb.set_style(style);
+        let msg = "Analyzing error trace...".to_string();
+        let colored = msg.truecolor(250, 179, 135).to_string();
+        pb.set_message(colored);
+    } else {
+        let style = ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap();
+        pb.set_style(style);
+        pb.set_message("Analyzing error trace...");
+    }
+    
+    pb
+}
+
+fn print_success_banner(cmd: &str, use_color: bool) {
+    let width = terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(60)
+        .min(80);
+
+    if use_color {
+        let border_raw = "━".repeat(width);
+        let border = border_raw.bright_green();
+        let inner_raw = format!("  {}  ", cmd);
+        let inner = inner_raw.bright_green();
+        let check_raw = "✅".to_string();
+        let check = check_raw.bright_green();
+        println!("\n{}", border);
+        println!("{}   No errors detected!   {}", check, inner);
+        println!("{}", border);
+        println!();
+    } else {
+        let border = "=".repeat(width);
+        println!("\n{}", border);
+        println!("[OK] {} — No errors detected!", cmd);
+        println!("{}", border);
+        println!();
+    }
+}
+
+fn print_no_errors(use_color: bool) {
+    if use_color {
+        println!(
+            "\n{} {}\n",
+            "✅".to_string().bright_green(),
+            "No Nix errors detected in provided stderr.".bright_green()
+        );
+    } else {
+        println!("\n[OK] No Nix errors detected in provided stderr.\n");
+    }
 }
 
 fn read_stdin() -> String {

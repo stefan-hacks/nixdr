@@ -28,6 +28,9 @@ owo-colors = "4.0"
 terminal_size = "0.3"
 atty = "0.2"
 
+# Progress spinner and progress bars
+indicatif = "0.17"
+
 # HTTP client for fetching known error patterns / LLM suggestions
 ureq = { version = "2.9", optional = true }
 

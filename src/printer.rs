@@ -25,7 +25,7 @@ pub enum ColorMode {
 
 pub struct Printer {
     _color_mode: ColorMode,
-    use_color: bool,
+    pub use_color: bool,
 }
 
 impl Printer {
