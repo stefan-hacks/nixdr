@@ -109,6 +109,7 @@ impl Printer {
             ErrorClass::InfiniteRecursion => "INFINITE RECURSION",
             ErrorClass::NotAFunction => "TYPE ERROR",
             ErrorClass::AttributeMissing { .. } => "MISSING ATTRIBUTE",
+            ErrorClass::UndefinedVariable { .. } => "UNDEFINED VARIABLE",
             ErrorClass::BuilderFailed { .. } => "BUILD FAILED",
             ErrorClass::HashMismatch { .. } => "HASH MISMATCH",
             ErrorClass::Unknown => "UNKNOWN ERROR",
@@ -117,7 +118,7 @@ impl Printer {
         if self.use_color {
             let colored = match report.class {
                 ErrorClass::InfiniteRecursion | ErrorClass::NotAFunction |
-                ErrorClass::AttributeMissing { .. } | ErrorClass::Unknown => {
+                ErrorClass::AttributeMissing { .. } | ErrorClass::UndefinedVariable { .. } | ErrorClass::Unknown => {
                     label.bright_red().bold().to_string()
                 }
                 ErrorClass::BuilderFailed { .. } => {

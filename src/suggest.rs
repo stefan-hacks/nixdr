@@ -12,6 +12,7 @@ pub fn enrich(mut report: ErrorReport) -> ErrorReport {
         ErrorClass::InfiniteRecursion => suggest_infinite_recursion(&report),
         ErrorClass::NotAFunction => suggest_not_a_function(&report),
         ErrorClass::AttributeMissing { attribute } => suggest_attribute_missing(&report, attribute),
+        ErrorClass::UndefinedVariable { variable } => suggest_undefined_variable(&report, variable),
         ErrorClass::BuilderFailed { drv, exit_code } => suggest_builder_failed(&report, drv, *exit_code),
         ErrorClass::HashMismatch { specified, got } => suggest_hash_mismatch(&report, specified.as_deref(), got.as_deref()),
         ErrorClass::Unknown => suggest_unknown(&report),
@@ -118,6 +119,62 @@ fn suggest_attribute_missing(_report: &ErrorReport, attribute: &str) -> Vec<Sugg
             description: "NixOS options are only available when their module is loaded.".to_string(),
             command: Some("nixos-option {}".to_string()),
             code: None,
+        });
+    }
+
+    suggs
+}
+
+fn suggest_undefined_variable(report: &ErrorReport, variable: &str) -> Vec<Suggestion> {
+    let mut suggs = vec![
+        Suggestion {
+            title: "Check for typos in the variable name".to_string(),
+            description: format!("'{}' is not defined in this scope. Verify spelling.", variable),
+            command: None,
+            code: None,
+        },
+        Suggestion {
+            title: "Ensure the variable is in scope".to_string(),
+            description: "Variables must be defined before use or passed as function arguments.".to_string(),
+            command: None,
+            code: Some(format!(
+                "# Wrong: using an undefined name directly\n  myValue\n\n# Right: define it first\n  let myValue = 42; in myValue\n\n# Or pass as argument:\n  {{ myValue, ... }}: {{ /* ... */ }}"))
+        },
+        Suggestion {
+            title: "If a nixpkgs package, add pkgs. prefix".to_string(),
+            description: "Packages in nixpkgs must be referenced from the package set.".to_string(),
+            command: Some(format!("nix search nixpkgs {}", variable)),
+            code: Some(format!(
+                "# Wrong:\n  environment.systemPackages = [ {} ];\n\n# Right:\n  environment.systemPackages = [ pkgs.{} ];", variable, variable)),
+        },
+        Suggestion {
+            title: "If a flake input, ensure it is declared".to_string(),
+            description: "Flake inputs must be declared in flake.nix before use in modules.".to_string(),
+            command: None,
+            code: Some(
+                "# In flake.nix inputs:\n  my-input = { url = \"...\"; };\n\n# Then in modules:\n  inherit (inputs) my-input;".to_string()),
+        },
+    ];
+
+    // Context: systemPackages with missing pkgs. prefix
+    if report.raw.contains("environment.systemPackages") || report.raw.contains("environment.packages") {
+        suggs.push(Suggestion {
+            title: "System packages require pkgs. prefix".to_string(),
+            description: "Packages in `environment.systemPackages` must come from `pkgs`.".to_string(),
+            command: Some(format!("nix search nixpkgs {}", variable)),
+            code: Some(format!(
+                "# Change:\n  {}\n\n# To:\n  pkgs.{}", variable, variable)),
+        });
+    }
+
+    // Context: in a flake.nix inputs block
+    if report.raw.contains("flake.nix") || report.raw.contains("inputs.") {
+        suggs.push(Suggestion {
+            title: "Flake input may not be passed to this module".to_string(),
+            description: "Make sure the input is passed via specialArgs or extraSpecialArgs.".to_string(),
+            command: None,
+            code: Some(
+                "# In your host definition:\n  specialArgs = {\n    inherit (inputs) my-input;\n  };".to_string()),
         });
     }
 

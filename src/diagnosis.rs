@@ -9,6 +9,7 @@ pub enum ErrorClass {
     InfiniteRecursion,
     NotAFunction,
     AttributeMissing { attribute: String },
+    UndefinedVariable { variable: String },
     BuilderFailed { drv: String, exit_code: i32 },
     HashMismatch { specified: Option<String>, got: Option<String> },
     Unknown,

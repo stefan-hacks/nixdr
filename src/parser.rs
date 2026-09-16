@@ -34,6 +34,9 @@ impl<'a> NixErrorParser<'a> {
         if let Some(report) = Self::try_hash_mismatch(text) {
             return report;
         }
+        if let Some(report) = Self::try_undefined_variable(text) {
+            return report;
+        }
 
         // Fallback: generic error with trace
         Self::parse_generic(text)
@@ -108,6 +111,30 @@ impl<'a> NixErrorParser<'a> {
         }
     }
 
+    fn try_undefined_variable(text: &str) -> Option<ErrorReport> {
+        let re = Regex::new(r"undefined variable '([^']+)'").unwrap();
+        if let Some(caps) = re.captures(text) {
+            let var = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let summary = format!("Undefined variable: '{}' not found in scope", var);
+            let trace = Self::extract_trace(text);
+            let location = Self::extract_crash_location(text);
+            let user_location = trace.last().and_then(|f| f.location.clone());
+
+            Some(ErrorReport {
+                class: ErrorClass::UndefinedVariable { variable: var },
+                summary,
+                detail: Self::extract_detail(text),
+                location,
+                user_location,
+                trace,
+                suggestions: vec![],
+                raw: text.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+
     fn try_builder_failed(text: &str) -> Option<ErrorReport> {
         let re = Regex::new(r"builder for '([^']+)' failed with exit code (\d+)").unwrap();
         if let Some(caps) = re.captures(text) {
@@ -156,11 +183,18 @@ impl<'a> NixErrorParser<'a> {
     }
 
     fn parse_generic(text: &str) -> ErrorReport {
-        let first_line = text.lines().next().unwrap_or("unknown error").to_string();
-        let summary = if first_line.starts_with("error:") {
-            first_line.trim_start_matches("error:").trim().to_string()
+        // Find the first actual error line (skip leading warnings/notices)
+        let error_line = text
+            .lines()
+            .find(|l| l.starts_with("error:"))
+            .map(|l| l.to_string())
+            .or_else(|| text.lines().next().map(|l| l.to_string()))
+            .unwrap_or_else(|| "unknown error".to_string());
+
+        let summary = if error_line.starts_with("error:") {
+            error_line.trim_start_matches("error:").trim().to_string()
         } else {
-            first_line
+            error_line
         };
         let trace = Self::extract_trace(text);
         let location = Self::extract_crash_location(text);
