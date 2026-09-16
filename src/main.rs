@@ -123,8 +123,9 @@ fn main() {
                 if let Some(ref s) = stdout {
                     let _ = io::stdout().write_all(s.as_bytes());
                 }
-                // If exit code is 0 and no stderr, nothing to diagnose
-                if code == 0 && stderr.as_ref().map_or(true, |s| s.is_empty()) {
+                // If exit code is 0, nix succeeded. Ignore any stderr
+                // (Nix prints warnings/notices to stderr even on success).
+                if code == 0 {
                     std::process::exit(0);
                 }
                 stderr.unwrap_or_default()
