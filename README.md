@@ -16,13 +16,13 @@
 
 </div>
 
-> **Nix error traces are printed bottom-up.** The first frame is deep inside nixpkgs; the last frame is your code. `nixdr` restructures them into a natural top-down flow, classifies the error into one of five known patterns, and attaches context-aware fix suggestions.
+> **Nix error traces are printed bottom-up.** The first frame is deep inside nixpkgs; the last frame is your code. `nixdr` restructures them into a natural top-down flow, classifies the error into one of six known patterns, and attaches context-aware fix suggestions.
 
 ---
 
-## 🚀 Quick Start (No Installation)
+## 🚀 Quick Start
 
-Run `nixdr` directly from GitHub without installing anything:
+No installation required. Run `nixdr` directly from GitHub:
 
 ```bash
 # Diagnose a Nix expression
@@ -34,67 +34,83 @@ nix run github:stefan-hacks/nixdr -- build .
 # Diagnose flake checks
 nix run github:stefan-hacks/nixdr -- check --show-trace
 
-# Diagnose a NixOS rebuild
-nix run github:stefan-hacks/nixdr -- rebuild switch --flake .#
-
 # Pipe mode: diagnose any Nix command
 nix build . --show-trace 2>&1 | nix run github:stefan-hacks/nixdr -- --stdin
-
-# JSON output for CI / editors
-nix build . --show-trace 2>&1 | nix run github:stefan-hacks/nixdr -- --stdin --json
 ```
 
 ---
 
 ## 📦 Installed Usage
 
-Once `nixdr` is in your `PATH` (via `nix run`, `nix profile install`, or NixOS/Home Manager):
+Once `nixdr` is in your `PATH`, use it as a drop-in replacement for `nix` commands.
 
-### Wrapper Commands
-
-Replace `nix` with `nixdr` to get automatic error diagnosis:
+### Your Own Repository
 
 ```bash
-nixdr build .                          # nix build + diagnosis
-nixdr eval --expr '...'                # nix eval + diagnosis
-nixdr check --show-trace               # nix flake check + diagnosis
-nixdr rebuild switch --flake .#ghost   # nixos-rebuild + diagnosis
-nixdr develop .                        # nix develop + diagnosis
-nixdr run nixpkgs#hello                # nix run + diagnosis
+cd ~/my-flake
+
+# Check your flake for errors
+nixdr check --show-trace
+
+# Evaluate a specific expression
+nixdr eval --expr '{ a = 1; }.b'
+
+# Build with diagnosis
+nixdr build . --show-trace
+
+# NixOS rebuild with diagnosis
+nixdr rebuild switch --flake .#ghost
 ```
 
-### Pipe Mode
-
-Already ran the command? Pipe stderr retroactively:
+### Other People's Repositories
 
 ```bash
-nix build . --show-trace 2>&1 | nixdr --stdin
+# Clone any Nix/NixOS repo and diagnose it
+git clone https://github.com/some-user/nixos-config.git /tmp/their-config
+cd /tmp/their-config
+
+# Check their flake (dry-run, no changes to your system)
+nix flake check 2>&1 | nixdr --stdin
+
+# Evaluate their NixOS configuration without building
+nix eval .#nixosConfigurations.hostname.config.system.build.toplevel --show-trace 2>&1 | nixdr --stdin
+
+# Build one of their packages to see if it compiles
+nix build .#some-package 2>&1 | nixdr --stdin
+```
+
+### Pipe Mode — Retroactive Diagnosis
+
+Already ran a Nix command and got an error? Pipe the stderr through `nixdr`:
+
+```bash
+# Basic pipe
 nix flake check --show-trace 2>&1 | nixdr --stdin
+
+# JSON output for scripts/CI
+nix build . --show-trace 2>&1 | nixdr --stdin --json
+
+# Filter only the error class
+nix build . --show-trace 2>&1 | nixdr --stdin --json | jq -r '.class'
+
+# Check if build succeeded programmatically
+nix build . 2>&1 | nixdr --stdin && echo "BUILD OK" || echo "BUILD FAILED"
 ```
 
-### JSON Mode
-
-For CI pipelines, editors, or programmatic consumption:
+### Advanced Usage
 
 ```bash
-nix build . 2>&1 | nixdr --stdin --json | jq '.class'
-```
+# Show full trace (not filtered to user code)
+nixdr check --show-trace --verbose
 
-Example output:
+# Limit trace depth
+nixdr eval --expr '...' --show-trace --max-trace-depth 5
 
-```json
-{
-  "class": "infinite_recursion",
-  "summary": "Infinite recursion: an attribute depends on itself",
-  "location": { "file": "«string»", "line": 1, "column": 9 },
-  "suggestions": [
-    {
-      "title": "Add a default value or guard",
-      "description": "An attribute depends on itself. Break the cycle with `lib.mkDefault` or a conditional.",
-      "code": "myOption = lib.mkDefault \"defaultValue\";"
-    }
-  ]
-}
+# Force color even when piping to less
+nix build . 2>&1 | nixdr --stdin --color=always | less -R
+
+# No color (for logs)
+nixdr check --color=never
 ```
 
 ---
@@ -105,13 +121,11 @@ When you run `nixdr`, you get live feedback:
 
 ### Success — No errors detected
 
-During the Nix command, a Catppuccin-themed spinner runs:
-
 ```
 ❄️  Running nix flake check...
 ```
 
-On success, a green bordered banner appears:
+Then a green bordered banner:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -121,21 +135,28 @@ On success, a green bordered banner appears:
 
 ### Error detected — Analysis in progress
 
-If an error occurs, the spinner changes:
-
 ```
 🔍  Analyzing error trace...
 ```
 
-Then the structured diagnosis is printed with the full error class, location, trace, and actionable suggestions.
+Then the structured diagnosis is printed with error class, location, trace, and actionable suggestions.
 
-### Pipe mode — Retroactive analysis
+### Warnings separated from errors
 
-```bash
-nix build . --show-trace 2>&1 | nixdr --stdin
+Nix prints warnings to stderr even on success. `nixdr` separates them:
+
 ```
+Notices:
+  warning: ignoring untrusted substituter 'https://look.cachix.org'
 
-The analysis spinner appears briefly, then the full diagnosis is printed.
+[UNDEFINED VARIABLE] Undefined variable: 'handy' not found in scope
+  at /home/stefan-hacks/.config/nixit/modules/nixos/packages.nix:266:5
+
+Suggestions:
+  1. Check for typos in the variable name
+  2. If a nixpkgs package, add pkgs. prefix
+     Change to: environment.systemPackages = [ pkgs.handy ];
+```
 
 ---
 
@@ -172,11 +193,6 @@ Suggestions:
      Two or more modules may reference each other. Use `lib.mkForce`.
      Change to:
        config.foo = lib.mkForce "override";
-
-  3. Use builtins.trace to debug
-     Insert trace calls to see which attribute triggers the loop.
-     Change to:
-       builtins.trace "Reached here" value
 ```
 
 ---
@@ -188,6 +204,7 @@ Suggestions:
 | 🔴 | **Infinite Recursion** | Attribute depends on itself | `lib.mkDefault`, `lib.mkForce` |
 | 🟠 | **Not a Function** | Value called as function | Check parentheses, argument count |
 | 🔵 | **Missing Attribute** | Key not found in set | Typo check, `?` guard, `or` default |
+| 🟢 | **Undefined Variable** | Name not in scope | Add `pkgs.`, `let`, or import |
 | 🟣 | **Builder Failed** | Compilation/test failure | `nix log`, fix source, check deps |
 | 🟡 | **Hash Mismatch** | FOD content changed | Update `sha256`, `cargoHash`, etc. |
 
@@ -211,13 +228,13 @@ Disable colors with `--color=never` or `NO_COLOR=1`.
 
 ## 🔧 Installation
 
-### Nix Run (One-shot)
+### Nix Run (One-shot, no persistence)
 
 ```bash
 nix run github:stefan-hacks/nixdr -- --help
 ```
 
-### Nix Profile (Persistent)
+### Nix Profile (Persistent user install)
 
 ```bash
 nix profile install github:stefan-hacks/nixdr
@@ -227,16 +244,24 @@ nixdr --help
 ### NixOS / Home Manager (Declarative)
 
 ```nix
-# flake.nix
+# flake.nix inputs
 inputs.nixdr = {
   url = "github:stefan-hacks/nixdr";
   inputs.nixpkgs.follows = "nixpkgs";
 };
 
-# configuration.nix or home.nix
+# configuration.nix
 { inputs, pkgs, ... }:
 {
   environment.systemPackages = [
+    inputs.nixdr.packages.${pkgs.system}.default
+  ];
+}
+
+# Or home.nix
+{ inputs, pkgs, ... }:
+{
+  home.packages = [
     inputs.nixdr.packages.${pkgs.system}.default
   ];
 }
