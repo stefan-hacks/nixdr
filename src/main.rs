@@ -28,6 +28,8 @@ mod parser;
 mod printer;
 mod suggest;
 mod trace;
+mod show;
+mod repl;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CLI
@@ -75,6 +77,19 @@ enum Commands {
     Develop { args: Vec<String> },
     /// `nix run` with error diagnosis
     Run { args: Vec<String> },
+    /// Show structured overview of a flake (local or remote)
+    Show {
+        #[arg(help = "Flake reference: ., github:owner/repo, nixpkgs#pkg, etc.")]
+        flake_ref: String,
+        /// Skip local clone; inspect directly via nix flake metadata
+        #[arg(long, default_value_t = false)]
+        remote: bool,
+    },
+    /// Interactive repl for exploring flake attributes
+    Repl {
+        #[arg(help = "Flake reference: ., github:owner/repo, github:owner/repo#attr.path")]
+        flake_ref: String,
+    },
 }
 
 fn main() {
@@ -99,10 +114,9 @@ fn main() {
         Some(Commands::Eval { ref args }) => {
             execute_with_spinner(("nix", vec!["eval"], args.clone()), &printer)
         }
-        Some(Commands::Check { ref args }) => execute_with_spinner(
-            ("nix", vec!["flake", "check"], args.clone()),
-            &printer,
-        ),
+        Some(Commands::Check { ref args }) => {
+            execute_with_spinner(("nix", vec!["flake", "check"], args.clone()), &printer)
+        }
         Some(Commands::Rebuild { ref args }) => {
             execute_with_spinner(("nixos-rebuild", vec![], args.clone()), &printer)
         }
@@ -111,6 +125,14 @@ fn main() {
         }
         Some(Commands::Run { ref args }) => {
             execute_with_spinner(("nix", vec!["run"], args.clone()), &printer)
+        }
+        Some(Commands::Show { ref flake_ref, .. }) => {
+            show::run(flake_ref, &printer).ok();
+            0
+        }
+        Some(Commands::Repl { ref flake_ref }) => {
+            repl::run(flake_ref, &printer);
+            0
         }
         None => {
             eprintln!("Usage: nixdr <command> [args...]");
